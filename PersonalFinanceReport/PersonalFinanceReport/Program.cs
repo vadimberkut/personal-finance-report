@@ -1,9 +1,11 @@
-﻿using Microsoft.Extensions.Configuration;
+﻿using CsvHelper;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using NodaTime;
 using NodaTime.Extensions;
+using PersonalFinanceReport.Models;
 using PersonalFinanceReport.Toshl;
 using PersonalFinanceReport.Toshl.Dto;
 using PersonalFinanceReport.Utils;
@@ -11,6 +13,7 @@ using Serilog;
 using Serilog.Events;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -54,28 +57,116 @@ namespace PersonalFinanceReport
 
             var serviceProvider = services.BuildServiceProvider();
 
-
             RunAsync(serviceProvider, config).GetAwaiter().GetResult();
 
             Console.WriteLine("Press any key to close...");
-            Console.ReadKey();
+            // Console.ReadKey();
         }
 
         private static async Task RunAsync(IServiceProvider serviceProvider, ApplicationSettings config)
         {
+            // doesn't work for some reason
+            var logger = serviceProvider.GetRequiredService<ILogger<ToshHttpApiClient>>();
+
             var currentTz = DateTimeZoneProviders.Tzdb["Europe/Simferopol"];
 
-            var reportFrom = LocalDateTime.FromDateTime(DateTime.Now).With(DateAdjusters.StartOfMonth).InZoneLeniently(currentTz);
-            var reportTo = LocalDateTime.FromDateTime(DateTime.Now).With(DateAdjusters.EndOfMonth).InZoneLeniently(currentTz);
-            reportFrom = reportFrom.Minus(Duration.FromTicks(reportFrom.TimeOfDay.TickOfDay));
-            reportTo = reportTo.Plus(Duration.FromHours(24) - Duration.FromTicks(reportTo.TimeOfDay.TickOfDay));
-
-            var reportFromUtc = reportFrom.ToInstant().InUtc();
-            var reportToUtc = reportTo.ToInstant().InUtc();
+            var reportFromLocal = LocalDateTime.FromDateTime(DateTime.Now).With(DateAdjusters.StartOfMonth);
+            var reportToLocal = LocalDateTime.FromDateTime(DateTime.Now).With(DateAdjusters.EndOfMonth);
+            reportFromLocal = reportFromLocal.Minus(Period.FromTicks(reportFromLocal.TimeOfDay.TickOfDay));
+            reportToLocal = reportToLocal.Plus(Period.FromHours(24) - Period.FromTicks(reportToLocal.TimeOfDay.TickOfDay));
 
             var toshHttpApiClient = serviceProvider.GetRequiredService<ToshHttpApiClient>();
-            
-            var me = await toshHttpApiClient.MeAsync();
+
+            //// Current month report
+            var monthReport = await BuildReportForAPeriodAsync(
+                serviceProvider, config, toshHttpApiClient,
+                reportFromLocal,
+                reportToLocal,
+                currentTz
+            );
+
+            //Log.Information($"Month report: {reportFrom} - {reportTo}");
+            //Log.Information($"TotalExpenes: {monthReport.TotalExpenes}.");
+            //Log.Information($"TotalRegularExpenes: {monthReport.TotalRegularExpenes}.");
+            //Log.Information($"TotalUnregularExpenes: {monthReport.TotalUnregularExpenes}.");
+            //Log.Information($"TotalIncome: {monthReport.TotalIncome}.");
+            //Log.Information($"TotalRegularIncome: {monthReport.TotalRegularIncome}.");
+            //Log.Information($"TotalUnregularIncome: {monthReport.TotalUnregularIncome}.");
+            //Log.Information($"");
+
+            // All time report
+            var allReportFromLocal = LocalDateTime.FromDateTime(new DateTime(2017, 01, 01)).With(DateAdjusters.StartOfMonth);
+            // var allReportFromLocal = LocalDateTime.FromDateTime(new DateTime(2019, 12, 01)).With(DateAdjusters.StartOfMonth);
+            var allReportToLocal = LocalDateTime.FromDateTime(DateTime.Now).With(DateAdjusters.EndOfMonth);
+            var allReports = new List<FinancialMonthReportModel>();
+            for (LocalDateTime fromLocal = allReportFromLocal; fromLocal < allReportToLocal;)
+            {
+                var month = Period.FromMonths(1);
+                LocalDateTime toLocal = LocalDateTime.FromDateTime(fromLocal.ToDateTimeUnspecified()).With(DateAdjusters.EndOfMonth);
+                ZonedDateTime fromUtc = fromLocal.InZoneLeniently(currentTz).ToInstant().InUtc();
+                ZonedDateTime toUtc = toLocal.InZoneLeniently(currentTz).ToInstant().InUtc();
+
+                Log.Information($"Querying {fromLocal} - {toLocal}...");
+                var report = await BuildReportForAPeriodAsync(
+                   serviceProvider, config, toshHttpApiClient,
+                   fromLocal, 
+                   toLocal,
+                   currentTz
+                );
+
+                allReports.Add(report);
+
+                // increment by month
+                LocalDateTime nextMonthDayLocal = toLocal.PlusDays(1);
+                fromLocal = nextMonthDayLocal.With(DateAdjusters.StartOfMonth);
+            }
+
+            // save into CSV
+            var csvModels = allReports.Select(x => new FinancialMonthReportCsvModel()
+            {
+                From = x.From.ToString("yyyy-MM-dd"),
+                To = x.To.ToString("yyyy-MM-dd"),
+                PeriodName = x.PeriodName,
+                TotalExpenes = x.TotalExpenes,
+                TotalRegularExpenes = x.TotalRegularExpenes,
+                TotalUnregularExpenes = x.TotalUnregularExpenes,
+                TotalIncome = x.TotalIncome,
+                TotalRegularIncome = x.TotalRegularIncome,
+                TotalUnregularIncome = x.TotalUnregularIncome,
+            });
+
+            string exportPath = "./data-reports";
+            Directory.CreateDirectory(exportPath);
+            using (var streamWriter = new StreamWriter(Path.Combine(exportPath, $"full-history-report-{allReportFromLocal.ToDateTimeUnspecified().ToString("yyyy-MM-dd")}--{allReportToLocal.ToDateTimeUnspecified().ToString("yyyy-MM-dd")}.csv")))
+            {
+                using (var csvWriter = new CsvWriter(streamWriter, CultureInfo.InvariantCulture))
+                {
+                    csvWriter.WriteHeader<FinancialMonthReportCsvModel>();
+                    await csvWriter.NextRecordAsync();
+                    await csvWriter.WriteRecordsAsync(csvModels);
+                    await csvWriter.FlushAsync();
+                }
+            }
+            Log.Information($"");
+        }
+
+
+        private static IEnumerable<AccountResponseDto> _accounts = null;
+        private static IEnumerable<CategoryResponseDto> _expenseCategories = null;
+        private static IEnumerable<CategoryResponseDto> _incomeCategories = null;
+        private static async Task<FinancialMonthReportModel> BuildReportForAPeriodAsync(
+            IServiceProvider serviceProvider,
+            ApplicationSettings config,
+            ToshHttpApiClient toshHttpApiClient,
+            LocalDateTime fromLocal,
+            LocalDateTime toLocal,
+            DateTimeZone dateTimeZone
+        )
+        {
+            ZonedDateTime fromUtc = fromLocal.InZoneLeniently(dateTimeZone).ToInstant().InUtc();
+            ZonedDateTime toUtc = toLocal.InZoneLeniently(dateTimeZone).ToInstant().InUtc();
+
+            // var me = await toshHttpApiClient.MeAsync();
 
             const string cashAccountName = "Cash";
             const string dreamsAccountName = "Dreams";
@@ -84,42 +175,58 @@ namespace PersonalFinanceReport
             const string taxesCategoryName = "Taxes";
             const string loansCategoryName = "Loans";
 
-            var accounts = await toshHttpApiClient.AccountListAsync();
-            var cashAccount = accounts.Single(x => x.Name == cashAccountName);
-            var dreamsAccount = accounts.Single(x => x.Name == dreamsAccountName);
-            var cryptoAccount = accounts.Single(x => x.Name == cryptoAccountName);
+            const string depositCategoryName = "Deposit";
+            const string tradingCategoryName = "Trading";
+            const string reimbursementsCategoryName = "Reimbursements";
+            const string sellingCategoryName = "Selling";
 
-            var categories = await toshHttpApiClient.CategoryListAsync(
+            _accounts = _accounts ?? await toshHttpApiClient.AccountListAsync();
+            var cashAccount = _accounts.Single(x => x.Name == cashAccountName);
+            var dreamsAccount = _accounts.Single(x => x.Name == dreamsAccountName);
+            var cryptoAccount = _accounts.Single(x => x.Name == cryptoAccountName);
+
+            _expenseCategories = _expenseCategories ?? await toshHttpApiClient.CategoryListAsync(
                type: "expense",
                page: 0,
                perPage: ToshHttpApiClient.MaxPerPage
             );
-            var categoryNames = categories.Select(x => x.Name).ToList();
+            _incomeCategories = _incomeCategories ?? await toshHttpApiClient.CategoryListAsync(
+              type: "income",
+              page: 0,
+              perPage: ToshHttpApiClient.MaxPerPage
+           );
 
             var expenseEntries = await toshHttpApiClient.EntryListAllAsync(
-                fromDate: reportFromUtc.Date.ToString("yyyy-MM-dd", null),
-                toDate: reportToUtc.Date.ToString("yyyy-MM-dd", null),
+                fromDate: fromUtc.Date.ToString("yyyy-MM-dd", null),
+                toDate: toUtc.Date.ToString("yyyy-MM-dd", null),
                 type: "expense",
                 accounts: new List<string>() { cashAccount.Id },
                 notCategories: new List<string>() { }
             );
             var incomeEntries = await toshHttpApiClient.EntryListAllAsync(
-               fromDate: reportFromUtc.Date.ToString("yyyy-MM-dd", null),
-               toDate: reportToUtc.Date.ToString("yyyy-MM-dd", null),
+               fromDate: fromUtc.Date.ToString("yyyy-MM-dd", null),
+               toDate: toUtc.Date.ToString("yyyy-MM-dd", null),
                type: "income",
                accounts: new List<string>() { cashAccount.Id },
                notCategories: new List<string>() { }
             );
 
             // entry filters
-            var transfersToAccountsBlackList = new List<string>() 
+            var transfersToAccountsBlackList = new List<string>()
             {
                 cryptoAccount.Id,
             };
-            var categoriesBlackList = new List<string>()
+            var expenseUnregularCategories = new List<string>()
             {
-                categories.Single(x => x.Name == taxesCategoryName).Id,
-                categories.Single(x => x.Name == loansCategoryName).Id,
+                _expenseCategories.Single(x => x.Name == taxesCategoryName).Id,
+                _expenseCategories.Single(x => x.Name == loansCategoryName).Id,
+            };
+            var incomeUnregularCategories = new List<string>()
+            {
+                _incomeCategories.Single(x => x.Name == depositCategoryName).Id,
+                _incomeCategories.Single(x => x.Name == tradingCategoryName).Id,
+                _incomeCategories.Single(x => x.Name == reimbursementsCategoryName).Id,
+                _incomeCategories.Single(x => x.Name == sellingCategoryName).Id,
             };
 
             // filter entries
@@ -129,20 +236,51 @@ namespace PersonalFinanceReport
                 {
                     return false;
                 }
-                if (categoriesBlackList.Contains(x.Category))
+                if (expenseUnregularCategories.Contains(x.Category))
                 {
                     return false;
                 }
                 return true;
             };
-            var expenseEntriesFilteredOut = expenseEntries.Where(x => !expenseEntryFilteringPredicate(x)).ToList();
-            var expenseEntriesFiltered = expenseEntries.Where(x => expenseEntryFilteringPredicate(x)).ToList();
+            Func<EntryResponseDto, bool> incomeEntryFilteringPredicate = (x) =>
+            {
+                //if (x.IsTransfer && transfersToAccountsBlackList.Contains(x.Transaction.Account))
+                //{
+                //    return false;
+                //}
+                if (incomeUnregularCategories.Contains(x.Category))
+                {
+                    return false;
+                }
+                return true;
+            };
+            
+            var expenseRegularEntries = expenseEntries.Where(x => expenseEntryFilteringPredicate(x)).ToList();
+            var expenseUnregularEntries = expenseEntries.Where(x => !expenseEntryFilteringPredicate(x)).ToList();
+            var incomeRegularEntries = incomeEntries.Where(x => incomeEntryFilteringPredicate(x)).ToList();
+            var incomeUnregularEntries = incomeEntries.Where(x => !incomeEntryFilteringPredicate(x)).ToList();
 
             // build report
-            decimal totalRegularExpenes = expenseEntriesFiltered.Aggregate(0m, (accum, curr) => accum + curr.Amount);
-            decimal totalRegularIncome = incomeEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalExpenes = expenseEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalRegularExpenes = expenseRegularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalUnregularExpenes = expenseUnregularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
 
-            int a = 1;
+            decimal totalIncome = incomeEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalRegularIncome = incomeRegularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalUnregularIncome = incomeUnregularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+
+            return new FinancialMonthReportModel()
+            {
+                From = fromLocal.ToDateTimeUnspecified(),
+                To = toLocal.ToDateTimeUnspecified(),
+                PeriodName = fromLocal.ToDateTimeUnspecified().ToString("yyyy MMMM"), // 2020 April
+                TotalExpenes = totalExpenes,
+                TotalRegularExpenes = totalRegularExpenes,
+                TotalUnregularExpenes = totalUnregularExpenes,
+                TotalIncome = totalIncome,
+                TotalRegularIncome = totalRegularIncome,
+                TotalUnregularIncome = totalUnregularIncome,
+            };
         }
 
         #region Private members

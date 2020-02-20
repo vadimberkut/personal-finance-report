@@ -348,3 +348,6 @@ Secrets/
 # data logs
 data-logs/
 
+# custom CSV reports
+data-reports/
+

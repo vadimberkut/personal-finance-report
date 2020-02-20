@@ -121,8 +121,8 @@ namespace PersonalFinanceReport.Toshl
 
         // https://developer.toshl.com/docs/entries/list/
         public async Task<IEnumerable<EntryResponseDto>> EntryListAsync(
-            string fromDate,
-            string toDate,
+            string fromDate, // including
+            string toDate, // including
             string type, // expense, income, transaction
             List<string> accounts = null,
             List<string> categories = null,

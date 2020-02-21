@@ -21,6 +21,7 @@ using System.Threading.Tasks;
 
 namespace PersonalFinanceReport
 {
+    // https://joshclose.github.io/
     class Program
     {
         private const string _appName = "PersonalFinanceReport";
@@ -78,12 +79,12 @@ namespace PersonalFinanceReport
             var toshHttpApiClient = serviceProvider.GetRequiredService<ToshHttpApiClient>();
 
             //// Current month report
-            var monthReport = await BuildReportForAPeriodAsync(
-                serviceProvider, config, toshHttpApiClient,
-                reportFromLocal,
-                reportToLocal,
-                currentTz
-            );
+            //var monthReport = await BuildReportForAPeriodAsync(
+            //    serviceProvider, config, toshHttpApiClient,
+            //    reportFromLocal,
+            //    reportToLocal,
+            //    currentTz
+            //);
 
             //Log.Information($"Month report: {reportFrom} - {reportTo}");
             //Log.Information($"TotalExpenes: {monthReport.TotalExpenes}.");
@@ -121,6 +122,24 @@ namespace PersonalFinanceReport
                 fromLocal = nextMonthDayLocal.With(DateAdjusters.StartOfMonth);
             }
 
+            // calc grand totals
+            allReports = allReports.Select((x, i) =>
+            {
+                //var prevReports = allReports.GetRange(0, i);
+                //x.GrandTotalTradingExpenes = prevReports.Aggregate((decimal)0 , (accum, curr) =>
+                //{
+                //    accum += curr.GrandTotalTradingExpenes;
+                //    return accum;
+                //});
+
+                var prevReport = (i == 0 ? null : allReports[i - 1]);
+
+                x.GrandTotalTradingExpenes += (prevReport == null ? 0 + x.TotalTradingExpenes : prevReport.GrandTotalTradingExpenes + x.TotalTradingExpenes);
+                x.GrandTotalTradingIncome += (prevReport == null ? 0 + x.TotalTradingIncome : prevReport.GrandTotalTradingIncome + x.TotalTradingIncome);
+
+                return x;
+            }).ToList();
+
             // save into CSV
             var csvModels = allReports.Select(x => new FinancialMonthReportCsvModel()
             {
@@ -133,6 +152,12 @@ namespace PersonalFinanceReport
                 TotalIncome = x.TotalIncome,
                 TotalRegularIncome = x.TotalRegularIncome,
                 TotalUnregularIncome = x.TotalUnregularIncome,
+
+                TotalTradingExpenes = x.TotalTradingExpenes,
+                TotalTradingIncome = x.TotalTradingIncome,
+
+                GrandTotalTradingExpenes = x.GrandTotalTradingExpenes,
+                GrandTotalTradingIncome = x.GrandTotalTradingIncome,
             });
 
             string exportPath = "./data-reports";
@@ -228,6 +253,10 @@ namespace PersonalFinanceReport
                 _incomeCategories.Single(x => x.Name == reimbursementsCategoryName).Id,
                 _incomeCategories.Single(x => x.Name == sellingCategoryName).Id,
             };
+            var incomeTradingCategories = new List<string>()
+            {
+                _incomeCategories.Single(x => x.Name == tradingCategoryName).Id,
+            };
 
             // filter entries
             Func<EntryResponseDto, bool> expenseEntryFilteringPredicate = (x) =>
@@ -260,6 +289,27 @@ namespace PersonalFinanceReport
             var incomeRegularEntries = incomeEntries.Where(x => incomeEntryFilteringPredicate(x)).ToList();
             var incomeUnregularEntries = incomeEntries.Where(x => !incomeEntryFilteringPredicate(x)).ToList();
 
+            var expenseTradingEntries = expenseEntries.Where(x =>
+            {
+                if (x.IsTransfer && x.Transaction.Account == cryptoAccount.Id)
+                {
+                    return true;
+                }
+                return false;
+            }).ToList();
+            var incomeTradingEntries = incomeEntries.Where(x =>
+            {
+                if (x.IsTransfer && x.Transaction.Account == cashAccount.Id)
+                {
+                    return true;
+                }
+                if (incomeTradingCategories.Contains(x.Category))
+                {
+                    return true;
+                }
+                return false;
+            }).ToList();
+
             // build report
             decimal totalExpenes = expenseEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
             decimal totalRegularExpenes = expenseRegularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
@@ -268,6 +318,9 @@ namespace PersonalFinanceReport
             decimal totalIncome = incomeEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
             decimal totalRegularIncome = incomeRegularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
             decimal totalUnregularIncome = incomeUnregularEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+
+            decimal totalTradingExpenes = expenseTradingEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
+            decimal totalTradingIncome = incomeTradingEntries.Aggregate(0m, (accum, curr) => accum + curr.Amount);
 
             return new FinancialMonthReportModel()
             {
@@ -280,6 +333,9 @@ namespace PersonalFinanceReport
                 TotalIncome = totalIncome,
                 TotalRegularIncome = totalRegularIncome,
                 TotalUnregularIncome = totalUnregularIncome,
+
+                TotalTradingExpenes = totalTradingExpenes,
+                TotalTradingIncome = totalTradingIncome,
             };
         }
 
